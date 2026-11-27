@@ -1,0 +1,20 @@
+# Real Postman environments contain tokens - never commit them
+*.postman_environment.json
+environments/*.json
+!environments/*.example.json
+
+# Run results and reports
+results/*
+!results/.gitkeep
+reports/*
+!reports/.gitkeep
+
+# Node / newman
+node_modules/
+npm-debug.log*
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

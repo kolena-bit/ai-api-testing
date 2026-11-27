@@ -1,0 +1,15 @@
+{
+  "name": "Account API Tests (example)",
+  "values": [
+    { "key": "base_url", "value": "", "type": "default", "enabled": true },
+    { "key": "token", "value": "", "type": "secret", "enabled": true },
+    { "key": "invalid_token", "value": "", "type": "default", "enabled": true },
+    { "key": "test_first_name", "value": "", "type": "default", "enabled": true },
+    { "key": "test_last_name", "value": "", "type": "default", "enabled": true },
+    { "key": "test_phone", "value": "", "type": "default", "enabled": true },
+    { "key": "test_email", "value": "", "type": "default", "enabled": true },
+    { "key": "test_lang", "value": "", "type": "default", "enabled": true },
+    { "key": "missing_body_expected_status", "value": "", "type": "default", "enabled": true }
+  ],
+  "_postman_variable_scope": "environment"
+}
