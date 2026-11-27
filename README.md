@@ -61,3 +61,19 @@ newman run collections/account-api-collection.json \
 ```
 
 The exit code is non-zero if any test fails, so the command can be used in CI as is.
+
+## CI (GitHub Actions)
+
+Workflow `.github/workflows/newman.yml` — **API regression (Newman)**:
+
+- runs on push to `main` when the collection or the workflow changes, and manually (**Actions → API regression (Newman) → Run workflow**);
+- logs in via `POST /v1/auth/login` to get a fresh token, builds the environment and runs Newman (Node 22, `newman@6`, reporters `cli` and `json`);
+- uploads the JSON report as the `newman-report` artifact (kept 7 days) after removing the token, `Authorization` headers, base URL host and test-user email.
+
+Required repository secrets (**Settings → Secrets and variables → Actions**):
+
+| Secret | Meaning |
+|---|---|
+| `BASE_URL` | API base URL, without a trailing slash |
+| `TEST_USER_EMAIL` | email of a dedicated test user |
+| `TEST_USER_PASSWORD` | password of that user |
