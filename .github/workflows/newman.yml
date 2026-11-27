@@ -1,0 +1,160 @@
+name: API regression (Newman)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "collections/**"
+      - ".github/workflows/newman.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# The tests update one shared test profile, so runs must not overlap.
+concurrency:
+  group: api-regression
+  cancel-in-progress: false
+
+jobs:
+  newman:
+    name: Newman run
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up Node 22
+        uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+
+      - name: Install Newman
+        run: npm install -g newman@6 && newman --version
+
+      - name: Log in and build environment
+        env:
+          BASE_URL: ${{ secrets.BASE_URL }}
+          TEST_USER_EMAIL: ${{ secrets.TEST_USER_EMAIL }}
+          TEST_USER_PASSWORD: ${{ secrets.TEST_USER_PASSWORD }}
+        run: |
+          set -euo pipefail
+          for v in BASE_URL TEST_USER_EMAIL TEST_USER_PASSWORD; do
+            if [ -z "${!v}" ]; then echo "::error::Secret $v is not set"; exit 1; fi
+          done
+          base_url="${BASE_URL%/}"
+
+          body=$(jq -n --arg e "$TEST_USER_EMAIL" --arg p "$TEST_USER_PASSWORD" \
+            '{email: $e, password: $p, lang: "en"}')
+          status=$(curl -sS -o "$RUNNER_TEMP/login.json" -w '%{http_code}' \
+            -X POST "$base_url/v1/auth/login" \
+            -H 'Content-Type: application/json' -H 'Accept: application/json' \
+            -d "$body")
+          token=$(jq -r '.data.access_token // empty' "$RUNNER_TEMP/login.json" 2>/dev/null || true)
+          rm -f "$RUNNER_TEMP/login.json"
+          if [ -n "$token" ]; then echo "::add-mask::$token"; fi
+          if [ "$status" != "200" ] || [ -z "$token" ]; then
+            echo "::error::Login failed: HTTP $status"
+            exit 1
+          fi
+          printf '%s' "$token" > "$RUNNER_TEMP/token"
+
+          # Phone must match ^\+\d+$ and be unique, so generate it per run.
+          phone="+38099$(shuf -i 1000000-9999999 -n 1)"
+
+          # test_email must stay the test user's own email (unique field, used for login).
+          jq -n \
+            --arg base_url "$base_url" \
+            --arg token "$token" \
+            --arg email "$TEST_USER_EMAIL" \
+            --arg phone "$phone" \
+            '{
+              name: "ci",
+              values: [
+                {key: "base_url",        value: $base_url,              enabled: true},
+                {key: "token",           value: $token,                 enabled: true},
+                {key: "invalid_token",   value: "invalid.ci.token",     enabled: true},
+                {key: "test_first_name", value: "Regression",           enabled: true},
+                {key: "test_last_name",  value: "Bot",                  enabled: true},
+                {key: "test_phone",      value: $phone,                 enabled: true},
+                {key: "test_email",      value: $email,                 enabled: true},
+                {key: "test_lang",       value: "en",                   enabled: true}
+              ]
+            }' > "$RUNNER_TEMP/env.json"
+
+      - name: Run Newman
+        run: |
+          mkdir -p results
+          newman run collections/account-api-collection.json \
+            -e "$RUNNER_TEMP/env.json" \
+            -r cli,json \
+            --reporter-json-export results/newman-report.json
+
+      # The repo is public: strip the token, Authorization headers and test-user data
+      # from the report before it becomes a downloadable artifact.
+      - name: Sanitize report
+        if: always()
+        env:
+          BASE_URL: ${{ secrets.BASE_URL }}
+          TEST_USER_EMAIL: ${{ secrets.TEST_USER_EMAIL }}
+        run: |
+          set -euo pipefail
+          report=results/newman-report.json
+          if [ ! -f "$report" ]; then echo "No report to sanitize"; exit 0; fi
+          node - "$report" "$RUNNER_TEMP/token" <<'EOF'
+          const fs = require('fs');
+          const [reportPath, tokenPath] = process.argv.slice(2);
+          const token = fs.existsSync(tokenPath) ? fs.readFileSync(tokenPath, 'utf8').trim() : '';
+          const baseUrl = (process.env.BASE_URL || '').replace(/\/$/, '');
+          const email = process.env.TEST_USER_EMAIL || '';
+          let host = '';
+          try { host = baseUrl ? new URL(baseUrl).host : ''; } catch (e) {}
+
+          const report = JSON.parse(fs.readFileSync(reportPath, 'utf8'));
+          // Drop Authorization headers and hide the host (Newman stores it as an array of parts).
+          (function strip(node) {
+            if (Array.isArray(node)) {
+              for (let i = node.length - 1; i >= 0; i--) {
+                const h = node[i];
+                if (h && typeof h === 'object' && typeof h.key === 'string' && h.key.toLowerCase() === 'authorization') {
+                  node.splice(i, 1);
+                } else {
+                  strip(h);
+                }
+              }
+            } else if (node && typeof node === 'object') {
+              if (host && Array.isArray(node.host) && node.host.join('.') === host.split(':')[0]) {
+                node.host = ['[REDACTED_HOST]'];
+              }
+              for (const k of Object.keys(node)) strip(node[k]);
+            }
+          })(report);
+
+          let text = JSON.stringify(report, null, 2);
+          const replaceAll = (s, value, label) => (value ? s.split(value).join(label) : s);
+          text = replaceAll(text, token, '[REDACTED_TOKEN]');
+          text = replaceAll(text, baseUrl, '{{base_url}}');
+          text = replaceAll(text, email, '[REDACTED_EMAIL]');
+          text = replaceAll(text, host, '[REDACTED_HOST]');
+          fs.writeFileSync(reportPath, text);
+
+          if ((token && text.includes(token)) || /Bearer\s+eyJ/.test(text)) {
+            console.error('Token still present in report');
+            process.exit(1);
+          }
+          console.log('Report sanitized');
+          EOF
+
+      - name: Upload JSON report
+        if: always() && hashFiles('results/newman-report.json') != ''
+        uses: actions/upload-artifact@v5
+        with:
+          name: newman-report
+          path: results/newman-report.json
+          retention-days: 7
+
+      - name: Clean up secrets
+        if: always()
+        run: rm -f "$RUNNER_TEMP/token" "$RUNNER_TEMP/env.json"
