@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths:
       - "collections/**"
+      - "scripts/**"
       - ".github/workflows/newman.yml"
   workflow_dispatch:
 
@@ -21,6 +22,8 @@ jobs:
     name: Newman run
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    outputs:
+      has_html_report: ${{ steps.pages_site.outputs.ready }}
 
     steps:
       - name: Checkout
@@ -32,7 +35,9 @@ jobs:
           node-version: "22"
 
       - name: Install Newman
-        run: npm install -g newman@6 && newman --version
+        run: |
+          npm install -g newman@6 newman-reporter-htmlextra@1
+          newman --version
 
       - name: Log in and build environment
         env:
@@ -86,66 +91,29 @@ jobs:
 
       - name: Run Newman
         run: |
-          mkdir -p results
+          mkdir -p results reports
           newman run collections/account-api-collection.json \
             -e "$RUNNER_TEMP/env.json" \
-            -r cli,json \
-            --reporter-json-export results/newman-report.json
+            -r cli,json,htmlextra \
+            --reporter-json-export results/newman-report.json \
+            --reporter-htmlextra-export reports/index.html \
+            --reporter-htmlextra-title "Account API regression" \
+            --reporter-htmlextra-browserTitle "Account API regression" \
+            --reporter-htmlextra-skipHeaders "Authorization" \
+            --reporter-htmlextra-skipEnvironmentVars \
+            --reporter-htmlextra-skipGlobalVars
 
-      # The repo is public: strip the token, Authorization headers and test-user data
-      # from the report before it becomes a downloadable artifact.
-      - name: Sanitize report
+      # The repo and its Pages site are public: strip the token, Authorization headers,
+      # API host and test-user email from the reports before they are uploaded.
+      - name: Sanitize reports
+        id: sanitize
         if: always()
         env:
           BASE_URL: ${{ secrets.BASE_URL }}
           TEST_USER_EMAIL: ${{ secrets.TEST_USER_EMAIL }}
         run: |
-          set -euo pipefail
-          report=results/newman-report.json
-          if [ ! -f "$report" ]; then echo "No report to sanitize"; exit 0; fi
-          node - "$report" "$RUNNER_TEMP/token" <<'EOF'
-          const fs = require('fs');
-          const [reportPath, tokenPath] = process.argv.slice(2);
-          const token = fs.existsSync(tokenPath) ? fs.readFileSync(tokenPath, 'utf8').trim() : '';
-          const baseUrl = (process.env.BASE_URL || '').replace(/\/$/, '');
-          const email = process.env.TEST_USER_EMAIL || '';
-          let host = '';
-          try { host = baseUrl ? new URL(baseUrl).host : ''; } catch (e) {}
-
-          const report = JSON.parse(fs.readFileSync(reportPath, 'utf8'));
-          // Drop Authorization headers and hide the host (Newman stores it as an array of parts).
-          (function strip(node) {
-            if (Array.isArray(node)) {
-              for (let i = node.length - 1; i >= 0; i--) {
-                const h = node[i];
-                if (h && typeof h === 'object' && typeof h.key === 'string' && h.key.toLowerCase() === 'authorization') {
-                  node.splice(i, 1);
-                } else {
-                  strip(h);
-                }
-              }
-            } else if (node && typeof node === 'object') {
-              if (host && Array.isArray(node.host) && node.host.join('.') === host.split(':')[0]) {
-                node.host = ['[REDACTED_HOST]'];
-              }
-              for (const k of Object.keys(node)) strip(node[k]);
-            }
-          })(report);
-
-          let text = JSON.stringify(report, null, 2);
-          const replaceAll = (s, value, label) => (value ? s.split(value).join(label) : s);
-          text = replaceAll(text, token, '[REDACTED_TOKEN]');
-          text = replaceAll(text, baseUrl, '{{base_url}}');
-          text = replaceAll(text, email, '[REDACTED_EMAIL]');
-          text = replaceAll(text, host, '[REDACTED_HOST]');
-          fs.writeFileSync(reportPath, text);
-
-          if ((token && text.includes(token)) || /Bearer\s+eyJ/.test(text)) {
-            console.error('Token still present in report');
-            process.exit(1);
-          }
-          console.log('Report sanitized');
-          EOF
+          node scripts/sanitize-report.js "$RUNNER_TEMP/token" \
+            results/newman-report.json reports/index.html
 
       - name: Upload JSON report
         if: always() && hashFiles('results/newman-report.json') != ''
@@ -155,6 +123,51 @@ jobs:
           path: results/newman-report.json
           retention-days: 7
 
+      - name: Upload HTML report
+        if: always() && hashFiles('reports/index.html') != ''
+        uses: actions/upload-artifact@v5
+        with:
+          name: newman-html-report
+          path: reports/index.html
+          retention-days: 7
+
+      # Published even when assertions fail, but only from main and only after sanitizing succeeded.
+      - name: Prepare Pages site
+        id: pages_site
+        if: >-
+          always() && github.ref == 'refs/heads/main'
+          && steps.sanitize.outcome != 'failure'
+          && hashFiles('reports/index.html') != ''
+        run: |
+          mkdir -p "$RUNNER_TEMP/site"
+          cp reports/index.html "$RUNNER_TEMP/site/index.html"
+          echo "ready=true" >> "$GITHUB_OUTPUT"
+
+      - name: Upload Pages artifact
+        if: always() && steps.pages_site.outputs.ready == 'true'
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: ${{ runner.temp }}/site
+          retention-days: 7
+
       - name: Clean up secrets
         if: always()
         run: rm -f "$RUNNER_TEMP/token" "$RUNNER_TEMP/env.json"
+
+  deploy-report:
+    name: Publish HTML report to GitHub Pages
+    needs: newman
+    # Runs when Newman failed assertions too; skipped if there is no sanitized report.
+    if: always() && github.ref == 'refs/heads/main' && needs.newman.outputs.has_html_report == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
