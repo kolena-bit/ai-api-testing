@@ -68,7 +68,15 @@ Workflow `.github/workflows/newman.yml` — **API regression (Newman)**:
 
 - runs on push to `main` when the collection or the workflow changes, and manually (**Actions → API regression (Newman) → Run workflow**);
 - logs in via `POST /v1/auth/login` to get a fresh token, builds the environment and runs Newman (Node 22, `newman@6`, reporters `cli` and `json`);
-- uploads the JSON report as the `newman-report` artifact (kept 7 days) after removing the token, `Authorization` headers, base URL host and test-user email.
+- produces a JSON report and an HTML report ([newman-reporter-htmlextra](https://github.com/DannyDainton/newman-reporter-htmlextra));
+- removes the token, `Authorization` headers, API host and test-user email from both reports (`scripts/sanitize-report.js`) — if anything is left, the step fails and nothing is published;
+- uploads them as artifacts `newman-report` (JSON) and `newman-html-report` (HTML), kept 7 days;
+- on `main`, publishes the HTML report to GitHub Pages in a separate job (`deploy-report`), **also when assertions fail**:
+  **https://kolena-bit.github.io/ai-api-testing/**
+
+GitHub Pages must use **GitHub Actions** as the source (**Settings → Pages → Build and deployment → Source**).
+
+> The Pages site is public. Environment and global variables are not included in the HTML report.
 
 Required repository secrets (**Settings → Secrets and variables → Actions**):
 
