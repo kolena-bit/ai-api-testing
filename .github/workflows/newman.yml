@@ -23,8 +23,11 @@ permissions:
 env:
   # Not a secret: kept in plain text so ticket links in the run summary work.
   JIRA_BASE_URL: https://e-chat.atlassian.net
-  # Status "on STAGE" is matched by id (10225) so a rename does not break the query.
-  JIRA_JQL: project = CHAT AND labels = "api-testing" AND status = 10225 ORDER BY key
+  # Project Chatum (key CHAT) only. Status "on STAGE" is matched by id (10225) so a rename
+  # does not break the query. Jira text search ignores brackets, so `summary ~ "API"` is only
+  # a coarse filter; the exact "[API]" check is done on the results (JIRA_SUMMARY_MARKER).
+  JIRA_JQL: project = CHAT AND status = 10225 AND summary ~ "API" ORDER BY key
+  JIRA_SUMMARY_MARKER: "[API]"
 
 # The tests update one shared test profile, so runs must not overlap.
 concurrency:
@@ -95,7 +98,7 @@ jobs:
           next=""
           while :; do
             body=$(jq -n --arg jql "$JIRA_JQL" --arg next "$next" \
-              '{jql: $jql, fields: ["key"], maxResults: 100}
+              '{jql: $jql, fields: ["summary"], maxResults: 100}
                + (if $next == "" then {} else {nextPageToken: $next} end)')
             status=$(curl -sS -o "$RUNNER_TEMP/search.json" -w '%{http_code}' \
               -u "$JIRA_EMAIL:$JIRA_API_TOKEN" \
@@ -106,7 +109,10 @@ jobs:
               echo "::error title=Jira gate::Jira search failed (HTTP $status) $msg"
               exit 1
             fi
-            jq -r '.issues[].key' "$RUNNER_TEMP/search.json" >> "$keys_file"
+            # Exact, case-sensitive "[API]" in the summary. Summaries are not printed (public repo).
+            jq -r --arg marker "$JIRA_SUMMARY_MARKER" \
+              '.issues[] | select((.fields.summary // "") | contains($marker)) | .key' \
+              "$RUNNER_TEMP/search.json" >> "$keys_file"
             next=$(jq -r '.nextPageToken // empty' "$RUNNER_TEMP/search.json")
             [ -n "$next" ] || break
           done
@@ -115,7 +121,7 @@ jobs:
           count=$(grep -c . "$keys_file" || true)
           {
             echo "## Jira gate"
-            echo "JQL: \`$JIRA_JQL\`"
+            echo "JQL: \`$JIRA_JQL\`, then summary contains \`$JIRA_SUMMARY_MARKER\`"
             echo
             if [ "$count" -gt 0 ]; then
               echo "Found **$count** ticket(s) — running the regression:"
