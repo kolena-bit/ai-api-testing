@@ -7,10 +7,24 @@ on:
       - "collections/**"
       - "scripts/**"
       - ".github/workflows/newman.yml"
+  # Weekly regression: Mondays 07:00 UTC, only if Jira has tickets ready for API testing.
+  schedule:
+    - cron: "0 7 * * 1"
   workflow_dispatch:
+    inputs:
+      jira_gate:
+        description: "Check Jira first (same logic as the weekly scheduled run)"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
+
+env:
+  # Not a secret: kept in plain text so ticket links in the run summary work.
+  JIRA_BASE_URL: https://e-chat.atlassian.net
+  # Status "on STAGE" is matched by id (10225) so a rename does not break the query.
+  JIRA_JQL: project = CHAT AND labels = "api-testing" AND status = 10225 ORDER BY key
 
 # The tests update one shared test profile, so runs must not overlap.
 concurrency:
@@ -18,11 +32,121 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # Runs only for the weekly schedule and for a manual run with jira_gate = true.
+  # Push and a plain manual run skip it and go straight to Newman.
+  jira-gate:
+    name: Jira gate
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.jira_gate)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      run_regression: ${{ steps.search.outputs.run_regression }}
+    steps:
+      - name: Check Jira secrets
+        env:
+          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+        run: |
+          missing=""
+          [ -n "$JIRA_EMAIL" ] || missing="$missing JIRA_EMAIL"
+          [ -n "$JIRA_API_TOKEN" ] || missing="$missing JIRA_API_TOKEN"
+          if [ -n "$missing" ]; then
+            echo "::error title=Jira gate::Missing repository secrets:$missing. The gated run cannot decide whether to run the regression."
+            {
+              echo "## Jira gate: failed"
+              echo "Missing repository secrets:**$missing**."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+      # Jira can answer anonymously (200 and 0 tickets), so check that we are really logged in.
+      - name: Verify Jira login
+        env:
+          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+        run: |
+          set -euo pipefail
+          status=$(curl -sS -o "$RUNNER_TEMP/myself.json" -w '%{http_code}' \
+            -u "$JIRA_EMAIL:$JIRA_API_TOKEN" -H 'Accept: application/json' \
+            "$JIRA_BASE_URL/rest/api/3/myself")
+          account_id=$(jq -r '.accountId // empty' "$RUNNER_TEMP/myself.json" 2>/dev/null || true)
+          account_type=$(jq -r '.accountType // empty' "$RUNNER_TEMP/myself.json" 2>/dev/null || true)
+          active=$(jq -r '.active // empty' "$RUNNER_TEMP/myself.json" 2>/dev/null || true)
+          rm -f "$RUNNER_TEMP/myself.json"
+          if [ "$status" != "200" ] || [ -z "$account_id" ] || [ "$account_type" != "atlassian" ] || [ "$active" != "true" ]; then
+            echo "::error title=Jira gate::Jira login failed (HTTP $status, accountType='${account_type:-none}'). Check JIRA_EMAIL and JIRA_API_TOKEN."
+            {
+              echo "## Jira gate: failed"
+              echo "Not authenticated in Jira (HTTP $status). Check \`JIRA_EMAIL\` and \`JIRA_API_TOKEN\`."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "Jira login OK (accountType=$account_type)"
+
+      - name: Search tickets
+        id: search
+        env:
+          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+        run: |
+          set -euo pipefail
+          keys_file="$RUNNER_TEMP/keys.txt"
+          : > "$keys_file"
+          next=""
+          while :; do
+            body=$(jq -n --arg jql "$JIRA_JQL" --arg next "$next" \
+              '{jql: $jql, fields: ["key"], maxResults: 100}
+               + (if $next == "" then {} else {nextPageToken: $next} end)')
+            status=$(curl -sS -o "$RUNNER_TEMP/search.json" -w '%{http_code}' \
+              -u "$JIRA_EMAIL:$JIRA_API_TOKEN" \
+              -H 'Accept: application/json' -H 'Content-Type: application/json' \
+              -X POST "$JIRA_BASE_URL/rest/api/3/search/jql" -d "$body")
+            if [ "$status" != "200" ]; then
+              msg=$(jq -r '(.errorMessages // []) | join("; ")' "$RUNNER_TEMP/search.json" 2>/dev/null || true)
+              echo "::error title=Jira gate::Jira search failed (HTTP $status) $msg"
+              exit 1
+            fi
+            jq -r '.issues[].key' "$RUNNER_TEMP/search.json" >> "$keys_file"
+            next=$(jq -r '.nextPageToken // empty' "$RUNNER_TEMP/search.json")
+            [ -n "$next" ] || break
+          done
+          rm -f "$RUNNER_TEMP/search.json"
+
+          count=$(grep -c . "$keys_file" || true)
+          {
+            echo "## Jira gate"
+            echo "JQL: \`$JIRA_JQL\`"
+            echo
+            if [ "$count" -gt 0 ]; then
+              echo "Found **$count** ticket(s) — running the regression:"
+              echo
+              # Keys with links only: the repository is public, ticket titles are internal.
+              while read -r key; do echo "- [$key]($JIRA_BASE_URL/browse/$key)"; done < "$keys_file"
+            else
+              echo "No tickets found — the regression is **skipped** for this run."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "Found $count ticket(s): $(paste -sd ' ' "$keys_file")"
+          if [ "$count" -gt 0 ]; then
+            echo "run_regression=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run_regression=false" >> "$GITHUB_OUTPUT"
+          fi
+
   newman:
     name: Newman run
+    needs: jira-gate
+    # Gate skipped (push / plain manual run) -> run. Gate passed with tickets -> run.
+    # Gate failed or found nothing -> do not run.
+    if: >-
+      !cancelled() && (
+        needs.jira-gate.result == 'skipped'
+        || (needs.jira-gate.result == 'success' && needs.jira-gate.outputs.run_regression == 'true')
+      )
     runs-on: ubuntu-latest
     timeout-minutes: 15
     outputs:
+      newman_ran: ${{ steps.newman_status.outputs.ran }}
       has_html_report: ${{ steps.pages_site.outputs.ready }}
 
     steps:
@@ -90,6 +214,7 @@ jobs:
             }' > "$RUNNER_TEMP/env.json"
 
       - name: Run Newman
+        id: newman
         run: |
           mkdir -p results reports
           newman run collections/account-api-collection.json \
@@ -102,6 +227,12 @@ jobs:
             --reporter-htmlextra-skipHeaders "Authorization" \
             --reporter-htmlextra-skipEnvironmentVars \
             --reporter-htmlextra-skipGlobalVars
+
+      # "Ran" = Newman actually executed (passed or with failed assertions), not skipped after a failed login.
+      - name: Record Newman status
+        id: newman_status
+        if: always() && (steps.newman.outcome == 'success' || steps.newman.outcome == 'failure')
+        run: echo "ran=true" >> "$GITHUB_OUTPUT"
 
       # The repo and its Pages site are public: strip the token, Authorization headers,
       # API host and test-user email from the reports before they are uploaded.
@@ -136,7 +267,8 @@ jobs:
         id: pages_site
         if: >-
           always() && github.ref == 'refs/heads/main'
-          && steps.sanitize.outcome != 'failure'
+          && steps.newman_status.outputs.ran == 'true'
+          && steps.sanitize.outcome == 'success'
           && hashFiles('reports/index.html') != ''
         run: |
           mkdir -p "$RUNNER_TEMP/site"
@@ -154,11 +286,16 @@ jobs:
         if: always()
         run: rm -f "$RUNNER_TEMP/token" "$RUNNER_TEMP/env.json"
 
-  deploy-report:
+  publish-report:
     name: Publish HTML report to GitHub Pages
     needs: newman
-    # Runs when Newman failed assertions too; skipped if there is no sanitized report.
-    if: always() && github.ref == 'refs/heads/main' && needs.newman.outputs.has_html_report == 'true'
+    # Only when Newman really ran (also with failed assertions) and a sanitized report exists.
+    # Not when Newman was skipped by the Jira gate or stopped before the run (e.g. API login failed).
+    if: >-
+      !cancelled() && github.ref == 'refs/heads/main'
+      && needs.newman.result != 'skipped'
+      && needs.newman.outputs.newman_ran == 'true'
+      && needs.newman.outputs.has_html_report == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
