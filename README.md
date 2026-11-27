@@ -66,13 +66,38 @@ The exit code is non-zero if any test fails, so the command can be used in CI as
 
 Workflow `.github/workflows/newman.yml` — **API regression (Newman)**:
 
-- runs on push to `main` when the collection or the workflow changes, and manually (**Actions → API regression (Newman) → Run workflow**);
-- logs in via `POST /v1/auth/login` to get a fresh token, builds the environment and runs Newman (Node 22, `newman@6`, reporters `cli` and `json`);
+- logs in via `POST /v1/auth/login` to get a fresh token, builds the environment and runs Newman (Node 22, `newman@6`, reporters `cli`, `json`, `htmlextra`);
 - produces a JSON report and an HTML report ([newman-reporter-htmlextra](https://github.com/DannyDainton/newman-reporter-htmlextra));
 - removes the token, `Authorization` headers, API host and test-user email from both reports (`scripts/sanitize-report.js`) — if anything is left, the step fails and nothing is published;
 - uploads them as artifacts `newman-report` (JSON) and `newman-html-report` (HTML), kept 7 days;
-- on `main`, publishes the HTML report to GitHub Pages in a separate job (`deploy-report`), **also when assertions fail**:
+- on `main`, publishes the HTML report to GitHub Pages in a separate job (`publish-report`), **also when assertions fail** — but only if Newman really ran:
   **https://kolena-bit.github.io/ai-api-testing/**
+
+### When it runs
+
+| Trigger | Jira gate | Regression |
+|---|---|---|
+| Push to `main` changing `collections/**`, `scripts/**` or the workflow | no | always |
+| Manual run (**Actions → API regression (Newman) → Run workflow**), `jira_gate` off | no | always |
+| Manual run with `jira_gate` on | yes | only if tickets are found |
+| **Weekly schedule — Mondays 07:00 UTC** | yes | only if tickets are found |
+
+### Jira gate
+
+Job `jira-gate` decides whether the weekly run executes the regression:
+
+1. Fails with an explicit error if `JIRA_EMAIL` or `JIRA_API_TOKEN` is not set — a scheduled run is never skipped silently.
+2. Calls `GET /rest/api/3/myself` and fails unless it is a real, active Atlassian account. Jira can answer anonymous requests with `200` and an empty result, which would look like "no tickets".
+3. Searches `POST /rest/api/3/search/jql` (all pages) on `https://e-chat.atlassian.net` with:
+
+   ```
+   project = CHAT AND labels = "api-testing" AND status = 10225 ORDER BY key
+   ```
+
+   Status `10225` is **on STAGE**; the id is used so a rename does not break the query.
+4. Writes the result to the run summary: ticket keys with links (no titles — the repository is public). With 0 tickets the `newman` and `publish-report` jobs are skipped and the run stays green.
+
+To include a ticket in the weekly regression, add the label `api-testing` to it and move it to **on STAGE**.
 
 GitHub Pages must use **GitHub Actions** as the source (**Settings → Pages → Build and deployment → Source**).
 
@@ -85,3 +110,5 @@ Required repository secrets (**Settings → Secrets and variables → Actions**)
 | `BASE_URL` | API base URL, without a trailing slash |
 | `TEST_USER_EMAIL` | email of a dedicated test user |
 | `TEST_USER_PASSWORD` | password of that user |
+| `JIRA_EMAIL` | email of the Atlassian account that owns `JIRA_API_TOKEN` (Jira gate only) |
+| `JIRA_API_TOKEN` | Atlassian API token, created at https://id.atlassian.com/manage-profile/security/api-tokens (Jira gate only) |
