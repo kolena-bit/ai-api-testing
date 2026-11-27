@@ -91,13 +91,15 @@ Job `jira-gate` decides whether the weekly run executes the regression:
 3. Searches `POST /rest/api/3/search/jql` (all pages) on `https://e-chat.atlassian.net` with:
 
    ```
-   project = CHAT AND labels = "api-testing" AND status = 10225 ORDER BY key
+   project = CHAT AND status = 10225 AND summary ~ "API" ORDER BY key
    ```
 
-   Status `10225` is **on STAGE**; the id is used so a rename does not break the query.
+   - `CHAT` is the **Chatum** project only;
+   - status `10225` is **on STAGE**; the id is used so a rename does not break the query;
+   - Jira text search ignores brackets, so `summary ~ "API"` is a coarse filter only — the gate then keeps tickets whose summary literally contains **`[API]`** (case-sensitive).
 4. Writes the result to the run summary: ticket keys with links (no titles — the repository is public). With 0 tickets the `newman` and `publish-report` jobs are skipped and the run stays green.
 
-To include a ticket in the weekly regression, add the label `api-testing` to it and move it to **on STAGE**.
+To include a ticket in the weekly regression, create it in **Chatum**, put `[API]` in its summary (for example `[API] Check profile update`) and move it to **on STAGE**.
 
 GitHub Pages must use **GitHub Actions** as the source (**Settings → Pages → Build and deployment → Source**).
 
